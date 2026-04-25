@@ -11,9 +11,8 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
-        gradlePluginPortal()
     }
 }
 
-rootProject.name = "TarloSpeaker"
-include ":app"
+rootProject.name = 'TarloSpeak'
+include ':app'
