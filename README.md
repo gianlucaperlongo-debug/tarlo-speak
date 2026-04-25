@@ -2,6 +2,8 @@
 
 Tarlo Speaker e un'app Android in Kotlin e Jetpack Compose che carica file EPUB, estrae il testo dai file HTML/XHTML interni e li legge come audiolibro con Android Text-to-Speech in italiano.
 
+Package/applicationId: `com.tarlo.speak`.
+
 ## Funzioni
 
 - Caricamento EPUB con selettore documenti Android.
