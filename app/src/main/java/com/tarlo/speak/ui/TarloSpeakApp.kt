@@ -17,8 +17,10 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.FastForward
@@ -38,7 +40,9 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -53,6 +57,7 @@ import androidx.compose.ui.unit.sp
 import com.tarlo.speak.model.AudioDocument
 import com.tarlo.speak.model.TextHighlight
 import com.tarlo.speak.model.TtsVoiceInfo
+import com.tarlo.speak.model.VoicePreset
 
 data class TarloUiState(
     val documents: List<AudioDocument> = emptyList(),
@@ -62,8 +67,13 @@ data class TarloUiState(
     val ttsReady: Boolean = false,
     val voices: List<TtsVoiceInfo> = emptyList(),
     val selectedVoiceName: String? = null,
+    val showAllVoices: Boolean = false,
+    val selectedPreset: VoicePreset = VoicePreset.AUDIOLIBRO,
     val speechRate: Float = 1.0f,
     val voicePitch: Float = 0.92f,
+    val commaPauseMs: Int = 120,
+    val periodPauseMs: Int = 320,
+    val paragraphPauseMs: Int = 560,
     val highlight: TextHighlight = TextHighlight()
 )
 
@@ -75,8 +85,13 @@ fun TarloSpeakApp(
     onTogglePlay: () -> Unit,
     onStop: () -> Unit,
     onSkip: (Int) -> Unit,
+    onPresetChange: (VoicePreset) -> Unit,
+    onShowAllVoicesChange: (Boolean) -> Unit,
     onSpeedChange: (Float) -> Unit,
     onPitchChange: (Float) -> Unit,
+    onCommaPauseChange: (Float) -> Unit,
+    onPeriodPauseChange: (Float) -> Unit,
+    onParagraphPauseChange: (Float) -> Unit,
     onVoiceChange: (String) -> Unit,
     onTestVoice: () -> Unit
 ) {
@@ -90,7 +105,20 @@ fun TarloSpeakApp(
                 ) {
                     item { HomeHeader(state, onImportClick) }
                     item { CurrentReaderCard(state) }
-                    item { VoiceSettings(state, onSpeedChange, onPitchChange, onVoiceChange, onTestVoice) }
+                    item {
+                        VoiceSettings(
+                            state = state,
+                            onPresetChange = onPresetChange,
+                            onShowAllVoicesChange = onShowAllVoicesChange,
+                            onSpeedChange = onSpeedChange,
+                            onPitchChange = onPitchChange,
+                            onCommaPauseChange = onCommaPauseChange,
+                            onPeriodPauseChange = onPeriodPauseChange,
+                            onParagraphPauseChange = onParagraphPauseChange,
+                            onVoiceChange = onVoiceChange,
+                            onTestVoice = onTestVoice
+                        )
+                    }
                     item { DocumentList(state, onSelectDocument) }
                 }
 
@@ -148,6 +176,16 @@ private fun HomeHeader(state: TarloUiState, onImportClick: () -> Unit) {
 @Composable
 private fun CurrentReaderCard(state: TarloUiState) {
     val current = state.current
+    val text = current?.currentChunk?.takeIf { it.isNotBlank() } ?: "Qui apparira il testo attualmente in lettura."
+    val scrollState = rememberScrollState()
+
+    LaunchedEffect(state.highlight, text) {
+        if (text.isNotBlank() && state.highlight.isActive && scrollState.maxValue > 0) {
+            val ratio = state.highlight.start.toFloat() / text.length.toFloat().coerceAtLeast(1f)
+            scrollState.animateScrollTo((scrollState.maxValue * ratio).toInt())
+        }
+    }
+
     Card(
         colors = CardDefaults.cardColors(containerColor = TarloColors.Surface),
         shape = RoundedCornerShape(28.dp),
@@ -169,10 +207,16 @@ private fun CurrentReaderCard(state: TarloUiState) {
                 fontSize = 14.sp,
                 fontWeight = FontWeight.SemiBold
             )
-            HighlightedReaderText(
-                text = current?.currentChunk?.takeIf { it.isNotBlank() } ?: "Qui apparira il testo attualmente in lettura.",
-                highlight = state.highlight
-            )
+            Box(
+                modifier = Modifier
+                    .height(250.dp)
+                    .verticalScroll(scrollState)
+            ) {
+                HighlightedReaderText(
+                    text = text,
+                    highlight = state.highlight
+                )
+            }
         }
     }
 }
@@ -208,8 +252,13 @@ private fun HighlightedReaderText(text: String, highlight: TextHighlight) {
 @Composable
 private fun VoiceSettings(
     state: TarloUiState,
+    onPresetChange: (VoicePreset) -> Unit,
+    onShowAllVoicesChange: (Boolean) -> Unit,
     onSpeedChange: (Float) -> Unit,
     onPitchChange: (Float) -> Unit,
+    onCommaPauseChange: (Float) -> Unit,
+    onPeriodPauseChange: (Float) -> Unit,
+    onParagraphPauseChange: (Float) -> Unit,
     onVoiceChange: (String) -> Unit,
     onTestVoice: () -> Unit
 ) {
@@ -222,11 +271,19 @@ private fun VoiceSettings(
             Text("Voce", color = TarloColors.Ink, fontSize = 20.sp, fontWeight = FontWeight.Bold)
             Text("Scegli una voce installata nel motore Text-to-Speech Android.", color = TarloColors.Muted, fontSize = 14.sp)
 
+            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                Column(Modifier.weight(1f)) {
+                    Text("Mostra tutte le voci", color = TarloColors.Ink, fontWeight = FontWeight.SemiBold)
+                    Text("Disattivo: preferisce le voci italiane", color = TarloColors.Muted, fontSize = 12.sp)
+                }
+                Switch(checked = state.showAllVoices, onCheckedChange = onShowAllVoicesChange)
+            }
+
             if (state.voices.isEmpty()) {
                 Text("Installa altre voci TTS dalle impostazioni Android", color = TarloColors.Muted, fontSize = 14.sp)
             } else {
                 LazyColumn(
-                    modifier = Modifier.height(if (state.voices.size == 1) 92.dp else 190.dp),
+                    modifier = Modifier.height(if (state.voices.size == 1) 112.dp else 220.dp),
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     items(state.voices) { voice ->
@@ -247,6 +304,29 @@ private fun VoiceSettings(
                 }
             }
 
+            Text("Preset", color = TarloColors.Ink, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                VoicePreset.values().toList().chunked(2).forEach { rowItems ->
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                        rowItems.forEach { preset ->
+                            val selected = preset == state.selectedPreset
+                            Button(
+                                onClick = { onPresetChange(preset) },
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = if (selected) TarloColors.Accent else TarloColors.AccentSoft,
+                                    contentColor = if (selected) TarloColors.PlayerText else TarloColors.Ink
+                                ),
+                                shape = RoundedCornerShape(16.dp),
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Text(preset.label, maxLines = 1, overflow = TextOverflow.Ellipsis, fontSize = 13.sp)
+                            }
+                        }
+                        if (rowItems.size == 1) Spacer(Modifier.weight(1f))
+                    }
+                }
+            }
+
             Button(
                 onClick = onTestVoice,
                 enabled = state.ttsReady,
@@ -263,7 +343,7 @@ private fun VoiceSettings(
             Slider(
                 value = state.speechRate,
                 onValueChange = onSpeedChange,
-                valueRange = 0.65f..1.70f,
+                valueRange = 0.70f..1.40f,
                 colors = SliderDefaults.colors(
                     thumbColor = TarloColors.Accent,
                     activeTrackColor = TarloColors.Accent,
@@ -275,7 +355,43 @@ private fun VoiceSettings(
             Slider(
                 value = state.voicePitch,
                 onValueChange = onPitchChange,
-                valueRange = 0.75f..1.20f,
+                valueRange = 0.80f..1.20f,
+                colors = SliderDefaults.colors(
+                    thumbColor = TarloColors.Accent,
+                    activeTrackColor = TarloColors.Accent,
+                    inactiveTrackColor = TarloColors.SurfaceMuted
+                )
+            )
+
+            Text("Pausa virgola ${state.commaPauseMs} ms", color = TarloColors.Muted)
+            Slider(
+                value = state.commaPauseMs.toFloat(),
+                onValueChange = onCommaPauseChange,
+                valueRange = 0f..350f,
+                colors = SliderDefaults.colors(
+                    thumbColor = TarloColors.Accent,
+                    activeTrackColor = TarloColors.Accent,
+                    inactiveTrackColor = TarloColors.SurfaceMuted
+                )
+            )
+
+            Text("Pausa punto ${state.periodPauseMs} ms", color = TarloColors.Muted)
+            Slider(
+                value = state.periodPauseMs.toFloat(),
+                onValueChange = onPeriodPauseChange,
+                valueRange = 0f..750f,
+                colors = SliderDefaults.colors(
+                    thumbColor = TarloColors.Accent,
+                    activeTrackColor = TarloColors.Accent,
+                    inactiveTrackColor = TarloColors.SurfaceMuted
+                )
+            )
+
+            Text("Pausa fine paragrafo ${state.paragraphPauseMs} ms", color = TarloColors.Muted)
+            Slider(
+                value = state.paragraphPauseMs.toFloat(),
+                onValueChange = onParagraphPauseChange,
+                valueRange = 0f..1200f,
                 colors = SliderDefaults.colors(
                     thumbColor = TarloColors.Accent,
                     activeTrackColor = TarloColors.Accent,
@@ -301,6 +417,13 @@ private fun VoiceRow(voice: TtsVoiceInfo, selected: Boolean, onClick: () -> Unit
             Text(voice.name, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
             Text(
                 "${voice.displayLanguage} (${voice.languageTag}) - ${voice.quality}",
+                fontSize = 12.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                color = if (selected) TarloColors.PlayerText else TarloColors.Muted
+            )
+            Text(
+                "${voice.latency} - ${if (voice.requiresNetwork) "richiede rete" else "offline"}",
                 fontSize = 12.sp,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,

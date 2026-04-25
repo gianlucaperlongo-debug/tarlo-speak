@@ -13,11 +13,14 @@ import com.tarlo.speak.data.DocumentRepository
 import com.tarlo.speak.model.AudioDocument
 import com.tarlo.speak.model.TextHighlight
 import com.tarlo.speak.model.TtsVoiceInfo
+import com.tarlo.speak.model.VoicePreset
 import com.tarlo.speak.tts.TtsManager
 import com.tarlo.speak.ui.TarloSpeakApp
 import com.tarlo.speak.ui.TarloUiState
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -26,6 +29,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var ttsManager: TtsManager
     private lateinit var preferences: SharedPreferences
     private val scope = CoroutineScope(Dispatchers.Main)
+    private var nextChunkJob: Job? = null
 
     private var documents = androidx.compose.runtime.mutableStateOf<List<AudioDocument>>(emptyList())
     private var current = androidx.compose.runtime.mutableStateOf<AudioDocument?>(null)
@@ -34,8 +38,13 @@ class MainActivity : ComponentActivity() {
     private var ttsReady = androidx.compose.runtime.mutableStateOf(false)
     private var voices = androidx.compose.runtime.mutableStateOf<List<TtsVoiceInfo>>(emptyList())
     private var selectedVoiceName = androidx.compose.runtime.mutableStateOf<String?>(null)
-    private var speechRate = androidx.compose.runtime.mutableStateOf(1.0f)
-    private var voicePitch = androidx.compose.runtime.mutableStateOf(0.92f)
+    private var showAllVoices = androidx.compose.runtime.mutableStateOf(false)
+    private var selectedPreset = androidx.compose.runtime.mutableStateOf(VoicePreset.AUDIOLIBRO)
+    private var speechRate = androidx.compose.runtime.mutableStateOf(0.90f)
+    private var voicePitch = androidx.compose.runtime.mutableStateOf(1.0f)
+    private var commaPauseMs = androidx.compose.runtime.mutableStateOf(120)
+    private var periodPauseMs = androidx.compose.runtime.mutableStateOf(320)
+    private var paragraphPauseMs = androidx.compose.runtime.mutableStateOf(560)
     private var textHighlight = androidx.compose.runtime.mutableStateOf(TextHighlight())
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -43,9 +52,14 @@ class MainActivity : ComponentActivity() {
 
         repository = DocumentRepository(this)
         preferences = getSharedPreferences("tarlo_voice_settings", MODE_PRIVATE)
+        selectedPreset.value = VoicePreset.fromName(preferences.getString(KEY_VOICE_PRESET, VoicePreset.AUDIOLIBRO.name))
         selectedVoiceName.value = preferences.getString(KEY_SELECTED_VOICE, null)
-        speechRate.value = preferences.getFloat(KEY_SPEECH_RATE, 1.0f)
-        voicePitch.value = preferences.getFloat(KEY_VOICE_PITCH, 0.92f)
+        showAllVoices.value = preferences.getBoolean(KEY_SHOW_ALL_VOICES, false)
+        speechRate.value = preferences.getFloat(KEY_SPEECH_RATE, selectedPreset.value.rate)
+        voicePitch.value = preferences.getFloat(KEY_VOICE_PITCH, selectedPreset.value.pitch)
+        commaPauseMs.value = preferences.getInt(KEY_COMMA_PAUSE, selectedPreset.value.commaPauseMs)
+        periodPauseMs.value = preferences.getInt(KEY_PERIOD_PAUSE, selectedPreset.value.periodPauseMs)
+        paragraphPauseMs.value = preferences.getInt(KEY_PARAGRAPH_PAUSE, selectedPreset.value.paragraphPauseMs)
 
         ttsManager = TtsManager(
             context = this,
@@ -53,11 +67,11 @@ class MainActivity : ComponentActivity() {
             onReadyChanged = { ready, availableVoices ->
                 runOnUiThread {
                     ttsReady.value = ready
-                    voices.value = availableVoices
+                    voices.value = filterVoices(availableVoices)
                     val savedVoice = selectedVoiceName.value
-                    val selected = availableVoices.firstOrNull { it.name == savedVoice }
-                        ?: availableVoices.firstOrNull { it.isItalian }
-                        ?: availableVoices.firstOrNull()
+                    val selected = voices.value.firstOrNull { it.name == savedVoice }
+                        ?: voices.value.firstOrNull { it.isItalian }
+                        ?: voices.value.firstOrNull()
                     selectedVoiceName.value = selected?.name
                     selected?.name?.let { saveSelectedVoice(it) }
                     statusText.value = if (ready) "Voce italiana pronta" else "Text-to-Speech non disponibile"
@@ -70,7 +84,7 @@ class MainActivity : ComponentActivity() {
             },
             onChunkDone = {
                 runOnUiThread {
-                    if (isPlaying.value) moveToNextChunk()
+                    if (isPlaying.value) scheduleNextChunk()
                 }
             },
             onRangeStart = { start, end ->
@@ -107,8 +121,13 @@ class MainActivity : ComponentActivity() {
                     ttsReady = ttsReady.value,
                     voices = voices.value,
                     selectedVoiceName = selectedVoiceName.value,
+                    showAllVoices = showAllVoices.value,
+                    selectedPreset = selectedPreset.value,
                     speechRate = speechRate.value,
                     voicePitch = voicePitch.value,
+                    commaPauseMs = commaPauseMs.value,
+                    periodPauseMs = periodPauseMs.value,
+                    paragraphPauseMs = paragraphPauseMs.value,
                     highlight = textHighlight.value
                 ),
                 onImportClick = {
@@ -119,20 +138,26 @@ class MainActivity : ComponentActivity() {
                 onTogglePlay = { togglePlay() },
                 onStop = { stopReading() },
                 onSkip = { skip(it) },
+                onPresetChange = { preset -> applyPreset(preset) },
+                onShowAllVoicesChange = { enabled -> updateShowAllVoices(enabled) },
                 onSpeedChange = { speed -> updateSpeechRate(speed) },
                 onPitchChange = { pitch -> updateVoicePitch(pitch) },
+                onCommaPauseChange = { updateCommaPause(it.toInt()) },
+                onPeriodPauseChange = { updatePeriodPause(it.toInt()) },
+                onParagraphPauseChange = { updateParagraphPause(it.toInt()) },
                 onVoiceChange = { voiceName ->
                     selectedVoiceName.value = voiceName
                     saveSelectedVoice(voiceName)
                     ttsManager.setVoiceByName(voiceName)
                     statusText.value = "Voce selezionata"
                 },
-                onTestVoice = { ttsManager.testVoice(speechRate.value, voicePitch.value) }
+                onTestVoice = { testSelectedVoice() }
             )
         }
     }
 
     override fun onDestroy() {
+        nextChunkJob?.cancel()
         ttsManager.shutdown()
         super.onDestroy()
     }
@@ -156,7 +181,7 @@ class MainActivity : ComponentActivity() {
         scope.launch {
             statusText.value = "Importazione EPUB..."
             val document = runCatching {
-                withContext(Dispatchers.IO) { repository.loadEpub(uri) }
+                withContext(Dispatchers.IO) { repository.loadEpub(uri, selectedPreset.value.chunkLength) }
             }.getOrElse {
                 statusText.value = "Impossibile importare EPUB"
                 return@launch
@@ -178,6 +203,7 @@ class MainActivity : ComponentActivity() {
     private fun selectDocument(document: AudioDocument) {
         current.value = document
         isPlaying.value = false
+        nextChunkJob?.cancel()
         ttsManager.stop()
         textHighlight.value = TextHighlight()
         statusText.value = "Documento selezionato"
@@ -196,6 +222,7 @@ class MainActivity : ComponentActivity() {
 
         if (isPlaying.value) {
             isPlaying.value = false
+            nextChunkJob?.cancel()
             ttsManager.stop()
             textHighlight.value = TextHighlight()
             statusText.value = "Pausa"
@@ -209,6 +236,7 @@ class MainActivity : ComponentActivity() {
 
     private fun stopReading() {
         isPlaying.value = false
+        nextChunkJob?.cancel()
         ttsManager.stop()
         current.value?.let { document ->
             updateCurrent { document.copy(index = 0) }
@@ -225,7 +253,19 @@ class MainActivity : ComponentActivity() {
         updateCurrent { updated }
         textHighlight.value = if (isPlaying.value) fallbackHighlightForText(updated.currentChunk) else TextHighlight()
         statusText.value = updated.progressLabel
-        if (isPlaying.value) ttsManager.speak(updated)
+        if (isPlaying.value) {
+            nextChunkJob?.cancel()
+            ttsManager.speak(updated)
+        }
+    }
+
+    private fun scheduleNextChunk() {
+        nextChunkJob?.cancel()
+        val delayMs = naturalPauseFor(current.value?.currentChunk.orEmpty())
+        nextChunkJob = scope.launch {
+            delay(delayMs.toLong())
+            if (isPlaying.value) moveToNextChunk()
+        }
     }
 
     private fun moveToNextChunk() {
@@ -255,8 +295,71 @@ class MainActivity : ComponentActivity() {
         updateCurrent { it.copy(pitch = pitch) }
     }
 
+    private fun testSelectedVoice() {
+        if (isPlaying.value) {
+            isPlaying.value = false
+            nextChunkJob?.cancel()
+            textHighlight.value = TextHighlight()
+        }
+        statusText.value = "Test voce"
+        ttsManager.testVoice(speechRate.value, voicePitch.value)
+    }
+
     private fun saveSelectedVoice(voiceName: String) {
         preferences.edit().putString(KEY_SELECTED_VOICE, voiceName).apply()
+    }
+
+    private fun applyPreset(preset: VoicePreset) {
+        selectedPreset.value = preset
+        speechRate.value = preset.rate
+        voicePitch.value = preset.pitch
+        commaPauseMs.value = preset.commaPauseMs
+        periodPauseMs.value = preset.periodPauseMs
+        paragraphPauseMs.value = preset.paragraphPauseMs
+        preferences.edit()
+            .putString(KEY_VOICE_PRESET, preset.name)
+            .putFloat(KEY_SPEECH_RATE, preset.rate)
+            .putFloat(KEY_VOICE_PITCH, preset.pitch)
+            .putInt(KEY_COMMA_PAUSE, preset.commaPauseMs)
+            .putInt(KEY_PERIOD_PAUSE, preset.periodPauseMs)
+            .putInt(KEY_PARAGRAPH_PAUSE, preset.paragraphPauseMs)
+            .apply()
+        updateCurrent { it.copy(speed = preset.rate, pitch = preset.pitch) }
+        statusText.value = "Preset ${preset.label} applicato"
+    }
+
+    private fun updateShowAllVoices(enabled: Boolean) {
+        showAllVoices.value = enabled
+        preferences.edit().putBoolean(KEY_SHOW_ALL_VOICES, enabled).apply()
+        voices.value = filterVoices(ttsManager.availableVoices)
+    }
+
+    private fun updateCommaPause(value: Int) {
+        commaPauseMs.value = value
+        preferences.edit().putInt(KEY_COMMA_PAUSE, value).apply()
+    }
+
+    private fun updatePeriodPause(value: Int) {
+        periodPauseMs.value = value
+        preferences.edit().putInt(KEY_PERIOD_PAUSE, value).apply()
+    }
+
+    private fun updateParagraphPause(value: Int) {
+        paragraphPauseMs.value = value
+        preferences.edit().putInt(KEY_PARAGRAPH_PAUSE, value).apply()
+    }
+
+    private fun filterVoices(allVoices: List<TtsVoiceInfo>): List<TtsVoiceInfo> {
+        val preferred = allVoices.filter { it.isItalian }
+        return if (showAllVoices.value || preferred.isEmpty()) allVoices else preferred
+    }
+
+    private fun naturalPauseFor(text: String): Int {
+        val trimmed = text.trim()
+        val commaBonus = (trimmed.count { it == ',' || it == ';' || it == ':' } * commaPauseMs.value).coerceAtMost(commaPauseMs.value * 3)
+        val sentencePause = if (trimmed.endsWith(".") || trimmed.endsWith("!") || trimmed.endsWith("?")) periodPauseMs.value else 0
+        val paragraphPause = if (trimmed.length < 90 || trimmed.endsWith("\n")) paragraphPauseMs.value else 0
+        return (commaBonus + sentencePause + paragraphPause).coerceIn(0, 2200)
     }
 
     private fun updateCurrent(transform: (AudioDocument) -> AudioDocument) {
@@ -282,7 +385,12 @@ class MainActivity : ComponentActivity() {
 
     companion object {
         private const val KEY_SELECTED_VOICE = "selected_voice"
+        private const val KEY_SHOW_ALL_VOICES = "show_all_voices"
+        private const val KEY_VOICE_PRESET = "voice_preset"
         private const val KEY_SPEECH_RATE = "speech_rate"
         private const val KEY_VOICE_PITCH = "voice_pitch"
+        private const val KEY_COMMA_PAUSE = "comma_pause"
+        private const val KEY_PERIOD_PAUSE = "period_pause"
+        private const val KEY_PARAGRAPH_PAUSE = "paragraph_pause"
     }
 }

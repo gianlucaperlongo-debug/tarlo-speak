@@ -5,6 +5,8 @@ data class TtsVoiceInfo(
     val languageTag: String,
     val displayLanguage: String,
     val quality: String,
+    val latency: String,
+    val requiresNetwork: Boolean,
     val isItalian: Boolean,
     val isEnglish: Boolean
 )

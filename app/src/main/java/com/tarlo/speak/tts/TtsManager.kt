@@ -4,6 +4,7 @@ import android.content.Context
 import android.os.Bundle
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
+import android.speech.tts.Voice
 import com.tarlo.speak.model.AudioDocument
 import com.tarlo.speak.model.TtsVoiceInfo
 import java.io.File
@@ -23,14 +24,14 @@ class TtsManager(
 
     val availableVoices: List<TtsVoiceInfo>
         get() = getDeviceVoices()
-            .orEmpty()
-            .filter { it.locale.language == Locale.ITALIAN.language || it.locale.language == Locale.ENGLISH.language }
             .map { voice ->
                 TtsVoiceInfo(
                     name = voice.name,
                     languageTag = voice.locale.toLanguageTag(),
                     displayLanguage = voice.locale.getDisplayName(Locale.getDefault()).ifBlank { voice.locale.toLanguageTag() },
                     quality = qualityLabel(voice.quality),
+                    latency = latencyLabel(voice.latency),
+                    requiresNetwork = voice.isNetworkConnectionRequired,
                     isItalian = voice.locale.language == Locale.ITALIAN.language,
                     isEnglish = voice.locale.language == Locale.ENGLISH.language
                 )
@@ -116,15 +117,25 @@ class TtsManager(
 
     private fun qualityLabel(quality: Int): String {
         return when {
-            quality >= 500 -> "Qualita molto alta"
-            quality >= 400 -> "Qualita alta"
-            quality >= 300 -> "Qualita normale"
-            quality >= 200 -> "Qualita bassa"
+            quality >= Voice.QUALITY_VERY_HIGH -> "Qualita molto alta"
+            quality >= Voice.QUALITY_HIGH -> "Qualita alta"
+            quality >= Voice.QUALITY_NORMAL -> "Qualita normale"
+            quality >= Voice.QUALITY_LOW -> "Qualita bassa"
             else -> "Qualita molto bassa"
         }
     }
 
-    private fun getDeviceVoices() = tts?.getVoices().orEmpty()
+    private fun latencyLabel(latency: Int): String {
+        return when {
+            latency <= Voice.LATENCY_VERY_LOW -> "Latenza molto bassa"
+            latency <= Voice.LATENCY_LOW -> "Latenza bassa"
+            latency <= Voice.LATENCY_NORMAL -> "Latenza normale"
+            latency <= Voice.LATENCY_HIGH -> "Latenza alta"
+            else -> "Latenza molto alta"
+        }
+    }
+
+    private fun getDeviceVoices() = tts?.voices.orEmpty()
 
     private fun applySelectedVoice() {
         selectedVoiceName?.let { setVoiceByName(it) }

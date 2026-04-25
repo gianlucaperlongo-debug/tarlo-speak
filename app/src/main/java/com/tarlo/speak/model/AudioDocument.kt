@@ -11,6 +11,9 @@ data class AudioDocument(
     val progressLabel: String
         get() = if (chunks.isEmpty()) "0/0 blocchi" else "${index + 1}/${chunks.size} blocchi"
 
+    val progressPercent: Int
+        get() = if (chunks.isEmpty()) 0 else (((index + 1).toFloat() / chunks.size.toFloat()) * 100).toInt().coerceIn(0, 100)
+
     val currentChunk: String
         get() = chunks.getOrNull(index).orEmpty()
 }
