@@ -12,7 +12,11 @@ class TtsManager(
     private val onChunkStarted: () -> Unit,
     private val onChunkDone: () -> Unit,
     private val onRangeStart: (Int, Int) -> Unit,
-    private val onGoogleCharactersWillBeSent: (Int) -> Boolean,
+    private val onGoogleCharactersWillBeSent: (TtsProviderType, Int) -> Boolean,
+    private val onGoogleCharactersSent: (TtsProviderType, Int) -> Unit,
+    private val onCacheHit: (Int) -> Unit,
+    private val onCacheStored: () -> Unit,
+    private val onCacheWriteSkipped: () -> Unit,
     private val onError: (String) -> Unit
 ) {
     private val androidProvider = AndroidTtsProvider(
@@ -29,7 +33,11 @@ class TtsManager(
         context = context,
         onChunkStarted = onChunkStarted,
         onChunkDone = onChunkDone,
-        onCharactersWillBeSent = onGoogleCharactersWillBeSent,
+        onCharactersCanBeSent = onGoogleCharactersWillBeSent,
+        onCharactersSent = onGoogleCharactersSent,
+        onCacheHit = onCacheHit,
+        onCacheStored = onCacheStored,
+        onCacheWriteSkipped = onCacheWriteSkipped,
         onError = onError
     )
 
@@ -40,12 +48,16 @@ class TtsManager(
 
     fun configureProvider(type: TtsProviderType, googleApiKey: String, googleVoiceName: String) {
         providerType = type
-        googleProvider.configure(googleApiKey, googleVoiceName)
+        googleProvider.configure(googleApiKey, googleVoiceName, type)
+    }
+
+    fun configureCache(enabled: Boolean, onlyCacheMode: Boolean, maxSizeMb: Int, presetName: String) {
+        googleProvider.configureCache(enabled, onlyCacheMode, maxSizeMb, presetName)
     }
 
     fun speakText(text: String, speed: Float, pitch: Float, utteranceId: String, preferredProvider: TtsProviderType = providerType) {
         if (text.isBlank()) return
-        if (preferredProvider == TtsProviderType.GOOGLE_CLOUD) {
+        if (preferredProvider.isGoogle) {
             androidProvider.stop()
             googleProvider.speak(text, speed, pitch, utteranceId)
         } else {
@@ -79,7 +91,7 @@ class TtsManager(
             speed = speed,
             pitch = pitch,
             utteranceId = "google-voice-test",
-            preferredProvider = TtsProviderType.GOOGLE_CLOUD
+            preferredProvider = providerType
         )
     }
 

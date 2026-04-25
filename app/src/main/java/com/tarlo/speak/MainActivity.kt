@@ -11,6 +11,8 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import com.tarlo.speak.data.DocumentRepository
 import com.tarlo.speak.model.AudioDocument
+import com.tarlo.speak.model.AudioCacheStats
+import com.tarlo.speak.model.GoogleVoiceInfo
 import com.tarlo.speak.model.HighlightMode
 import com.tarlo.speak.model.ReaderSegment
 import com.tarlo.speak.model.TextHighlight
@@ -18,6 +20,7 @@ import com.tarlo.speak.model.TtsProviderType
 import com.tarlo.speak.model.TtsVoiceInfo
 import com.tarlo.speak.model.VoicePreset
 import com.tarlo.speak.tts.GoogleCloudTtsProvider
+import com.tarlo.speak.tts.AudioCacheManager
 import com.tarlo.speak.tts.TtsManager
 import com.tarlo.speak.ui.TarloSpeakApp
 import com.tarlo.speak.ui.TarloUiState
@@ -30,10 +33,14 @@ import kotlinx.coroutines.withContext
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.net.HttpURLConnection
+import java.net.URL
+import java.net.URLEncoder
 
 class MainActivity : ComponentActivity() {
     private lateinit var repository: DocumentRepository
     private lateinit var ttsManager: TtsManager
+    private lateinit var audioCacheManager: AudioCacheManager
     private lateinit var preferences: SharedPreferences
 
     private val scope = CoroutineScope(Dispatchers.Main)
@@ -65,19 +72,37 @@ class MainActivity : ComponentActivity() {
     private var googleApiKey = androidx.compose.runtime.mutableStateOf("")
     private var googleApiKeyDraft = androidx.compose.runtime.mutableStateOf("")
     private var googleVoiceName = androidx.compose.runtime.mutableStateOf(GoogleCloudTtsProvider.DEFAULT_VOICE)
+    private var googleChirpVoiceName = androidx.compose.runtime.mutableStateOf(GoogleCloudTtsProvider.DEFAULT_CHIRP_VOICE)
+    private var googleChirpVoices = androidx.compose.runtime.mutableStateOf<List<GoogleVoiceInfo>>(emptyList())
+    private var googleWavenetVoices = androidx.compose.runtime.mutableStateOf<List<GoogleVoiceInfo>>(emptyList())
     private var googleCharsThisMonth = androidx.compose.runtime.mutableStateOf(0)
+    private var googleChirpCharsThisMonth = androidx.compose.runtime.mutableStateOf(0)
+    private var googleWavenetCharsThisMonth = androidx.compose.runtime.mutableStateOf(0)
     private var googleCounterMonth = androidx.compose.runtime.mutableStateOf(currentMonthKey())
     private var googleDisabledForMonth = androidx.compose.runtime.mutableStateOf(false)
     private var apiKeyChangeConfirmation = androidx.compose.runtime.mutableStateOf(false)
     private var deleteApiKeyConfirmation = androidx.compose.runtime.mutableStateOf(false)
     private var resetCounterConfirmation = androidx.compose.runtime.mutableStateOf(false)
+    private var audioCacheEnabled = androidx.compose.runtime.mutableStateOf(true)
+    private var precacheNextPage = androidx.compose.runtime.mutableStateOf(false)
+    private var audioCacheMaxSizeMb = androidx.compose.runtime.mutableStateOf(500)
+    private var audioCacheHitCount = androidx.compose.runtime.mutableStateOf(0)
+    private var audioCacheSavedCharacters = androidx.compose.runtime.mutableStateOf(0)
+    private var clearAudioCacheConfirmation = androidx.compose.runtime.mutableStateOf(false)
+    private var audioCacheStats = androidx.compose.runtime.mutableStateOf(AudioCacheStats())
+    private var creditSaverMode = androidx.compose.runtime.mutableStateOf(true)
+    private var onlyCacheMode = androidx.compose.runtime.mutableStateOf(false)
+    private var deleteDocumentConfirmationId = androidx.compose.runtime.mutableStateOf<String?>(null)
+    private var lastVoiceTestAt = 0L
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
         repository = DocumentRepository(this)
+        audioCacheManager = AudioCacheManager(this)
         preferences = getSharedPreferences("tarlo_voice_settings", MODE_PRIVATE)
         loadSettings()
+        refreshAudioCacheStats()
 
         ttsManager = TtsManager(
             context = this,
@@ -116,7 +141,29 @@ class MainActivity : ComponentActivity() {
                     }
                 }
             },
-            onGoogleCharactersWillBeSent = { characters -> reserveGoogleCharacters(characters) },
+            onGoogleCharactersWillBeSent = { provider, characters -> canSendGoogleCharacters(provider, characters) },
+            onGoogleCharactersSent = { provider, characters -> reserveGoogleCharacters(provider, characters) },
+            onCacheHit = { characters ->
+                runOnUiThread {
+                    audioCacheHitCount.value += 1
+                    audioCacheSavedCharacters.value += characters
+                    saveAudioCacheCounters()
+                    refreshAudioCacheStats()
+                    statusText.value = "Audio letto da cache: nessun carattere consumato."
+                }
+            },
+            onCacheStored = {
+                runOnUiThread {
+                    refreshAudioCacheStats()
+                    statusText.value = "Audio generato e salvato in cache."
+                }
+            },
+            onCacheWriteSkipped = {
+                runOnUiThread {
+                    refreshAudioCacheStats()
+                    statusText.value = "Spazio cache insufficiente: continuo senza salvare."
+                }
+            },
             onError = { message ->
                 runOnUiThread { handleTtsError(message) }
             }
@@ -157,23 +204,42 @@ class MainActivity : ComponentActivity() {
                     maskedGoogleApiKey = maskApiKey(googleApiKey.value),
                     hasGoogleApiKey = googleApiKey.value.isNotBlank(),
                     googleVoiceName = googleVoiceName.value,
-                    googleVoiceNames = GoogleCloudTtsProvider.ITALIAN_WAVENET_VOICES,
+                    googleChirpVoiceName = googleChirpVoiceName.value,
+                    googleChirpVoices = googleChirpVoices.value,
+                    googleWavenetVoices = googleWavenetVoices.value,
+                    googleVoiceNames = currentWavenetVoiceNames(),
                     googleCharsThisMonth = googleCharsThisMonth.value,
-                    googleMonthlyLimit = GOOGLE_MONTHLY_LIMIT,
-                    googleSafetyLimit = GOOGLE_BLOCK_LIMIT,
-                    googleSafetyPercent = googleSafetyPercent(),
-                    googleBlocked = isGoogleBlocked(),
+                    googleChirpCharsThisMonth = googleChirpCharsThisMonth.value,
+                    googleWavenetCharsThisMonth = googleWavenetCharsThisMonth.value,
+                    googleMonthlyLimit = GOOGLE_TOTAL_MONTHLY_LIMIT,
+                    chirpMonthlyLimit = CHIRP_MONTHLY_LIMIT,
+                    wavenetMonthlyLimit = WAVENET_MONTHLY_LIMIT,
+                    chirpSafetyLimit = CHIRP_BLOCK_LIMIT,
+                    wavenetSafetyLimit = WAVENET_BLOCK_LIMIT,
+                    chirpSafetyPercent = googleSafetyPercent(googleChirpCharsThisMonth.value, CHIRP_BLOCK_LIMIT),
+                    wavenetSafetyPercent = googleSafetyPercent(googleWavenetCharsThisMonth.value, WAVENET_BLOCK_LIMIT),
+                    googleBlocked = isAllGoogleBlocked(),
+                    chirpBlocked = isChirpBlocked(),
+                    wavenetBlocked = isWavenetBlocked(),
                     googleDisabledForMonth = googleDisabledForMonth.value,
-                    googleWarningText = googleWarningText(),
+                    chirpWarningText = googleWarningText(TtsProviderType.GOOGLE_CHIRP),
+                    wavenetWarningText = googleWarningText(TtsProviderType.GOOGLE_WAVENET),
                     apiKeyChangeConfirmation = apiKeyChangeConfirmation.value,
                     deleteApiKeyConfirmation = deleteApiKeyConfirmation.value,
-                    resetCounterConfirmation = resetCounterConfirmation.value
+                    resetCounterConfirmation = resetCounterConfirmation.value,
+                    audioCacheStats = audioCacheStats.value,
+                    precacheNextPage = precacheNextPage.value,
+                    clearAudioCacheConfirmation = clearAudioCacheConfirmation.value,
+                    creditSaverMode = creditSaverMode.value,
+                    onlyCacheMode = onlyCacheMode.value,
+                    deleteDocumentConfirmationId = deleteDocumentConfirmationId.value
                 ),
                 onImportClick = {
                     statusText.value = "Seleziona un file EPUB"
                     picker.launch(createOpenEpubIntent())
                 },
                 onSelectDocument = { selectDocument(it) },
+                onDeleteDocument = { deleteDocumentWithConfirmation(it) },
                 onTogglePlay = { togglePlay() },
                 onStop = { stopReading() },
                 onPreviousPage = { goToPage((current.value?.pageIndex ?: 0) - 1, restartReading = isPlaying.value) },
@@ -205,8 +271,21 @@ class MainActivity : ComponentActivity() {
                 onDeleteGoogleApiKey = { deleteGoogleApiKeyWithConfirmation() },
                 onUseAndroidForMonth = { useAndroidForRestOfMonth() },
                 onGoogleVoiceChange = { updateGoogleVoice(it) },
-                onTestPremiumVoice = { testPremiumVoice() },
-                onResetGoogleCounter = { resetGoogleCounterWithConfirmation() }
+                onGoogleChirpVoiceChange = { updateGoogleChirpVoice(it) },
+                onRefreshGoogleVoices = { refreshGoogleVoices() },
+                onUseWavenet = { updateProvider(TtsProviderType.GOOGLE_WAVENET) },
+                onUseAndroid = { updateProvider(TtsProviderType.ANDROID) },
+                onTestChirpVoice = { testPremiumVoice(TtsProviderType.GOOGLE_CHIRP) },
+                onTestWavenetVoice = { testPremiumVoice(TtsProviderType.GOOGLE_WAVENET) },
+                onResetGoogleCounter = { resetGoogleCounterWithConfirmation() },
+                onAudioCacheEnabledChange = { updateAudioCacheEnabled(it) },
+                onPrecacheNextPageChange = { updatePrecacheNextPage(it) },
+                onAudioCacheMaxSizeChange = { updateAudioCacheMaxSize(it) },
+                onRefreshAudioCache = { refreshAudioCacheStats("Spazio cache aggiornato") },
+                onClearAudioCache = { clearAudioCacheWithConfirmation() }
+                ,
+                onCreditSaverModeChange = { updateCreditSaverMode(it) },
+                onOnlyCacheModeChange = { updateOnlyCacheMode(it) }
             )
         }
     }
@@ -236,7 +315,16 @@ class MainActivity : ComponentActivity() {
         googleApiKeyDraft.value = ""
         googleVoiceName.value = preferences.getString(KEY_GOOGLE_VOICE, GoogleCloudTtsProvider.DEFAULT_VOICE).orEmpty()
             .ifBlank { GoogleCloudTtsProvider.DEFAULT_VOICE }
+        googleChirpVoiceName.value = preferences.getString(KEY_GOOGLE_CHIRP_VOICE, GoogleCloudTtsProvider.DEFAULT_CHIRP_VOICE).orEmpty()
+            .ifBlank { GoogleCloudTtsProvider.DEFAULT_CHIRP_VOICE }
         googleDisabledForMonth.value = preferences.getBoolean(KEY_GOOGLE_DISABLED_MONTH, false)
+        audioCacheEnabled.value = preferences.getBoolean(KEY_AUDIO_CACHE_ENABLED, true)
+        precacheNextPage.value = preferences.getBoolean(KEY_PRECACHE_NEXT_PAGE, false)
+        audioCacheMaxSizeMb.value = preferences.getInt(KEY_AUDIO_CACHE_MAX_MB, 500)
+        audioCacheHitCount.value = preferences.getInt(KEY_AUDIO_CACHE_HITS, 0)
+        audioCacheSavedCharacters.value = preferences.getInt(KEY_AUDIO_CACHE_SAVED_CHARS, 0)
+        creditSaverMode.value = preferences.getBoolean(KEY_CREDIT_SAVER_MODE, true)
+        onlyCacheMode.value = preferences.getBoolean(KEY_ONLY_CACHE_MODE, false)
         loadGoogleUsage()
     }
 
@@ -289,6 +377,24 @@ class MainActivity : ComponentActivity() {
         current.value = document
         textHighlight.value = TextHighlight()
         statusText.value = document.progressLabel
+    }
+
+    private fun deleteDocumentWithConfirmation(document: AudioDocument) {
+        if (deleteDocumentConfirmationId.value != document.id) {
+            deleteDocumentConfirmationId.value = document.id
+            statusText.value = "Tocca ancora Elimina per rimuovere ${document.title}"
+            return
+        }
+        if (current.value?.id == document.id) {
+            isPlaying.value = false
+            nextSegmentJob?.cancel()
+            ttsManager.stop()
+            current.value = null
+            textHighlight.value = TextHighlight()
+        }
+        documents.value = documents.value.filterNot { it.id == document.id }
+        deleteDocumentConfirmationId.value = null
+        statusText.value = "Documento eliminato"
     }
 
     private fun togglePlay() {
@@ -571,18 +677,27 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun updateProvider(provider: TtsProviderType) {
-        if (provider == TtsProviderType.GOOGLE_CLOUD && isGoogleBlocked()) {
+        if (provider == TtsProviderType.GOOGLE_CHIRP && isChirpBlocked()) {
+            updateProvider(TtsProviderType.GOOGLE_WAVENET)
+            statusText.value = "Chirp 3 HD bloccato: uso WaveNet"
+            return
+        }
+        if (provider == TtsProviderType.GOOGLE_WAVENET && isWavenetBlocked()) {
             selectedProvider.value = TtsProviderType.ANDROID
             preferences.edit().putString(KEY_SELECTED_PROVIDER, TtsProviderType.ANDROID.name).apply()
             configureTtsProvider(TtsProviderType.ANDROID)
-            statusText.value = "Google WaveNet bloccato per sicurezza"
+            statusText.value = "WaveNet bloccato per sicurezza: uso Android TTS"
             return
         }
         selectedProvider.value = provider
         preferences.edit().putString(KEY_SELECTED_PROVIDER, provider.name).apply()
         configureTtsProvider()
         updateCurrent { it.copy(providerType = provider) }
-        statusText.value = if (provider == TtsProviderType.GOOGLE_CLOUD) "Voce premium selezionata" else "Voce dispositivo selezionata"
+        statusText.value = when (provider) {
+            TtsProviderType.GOOGLE_CHIRP -> "Google Chirp 3 HD selezionato. Cambiare provider puo rigenerare audio e consumare caratteri Google."
+            TtsProviderType.GOOGLE_WAVENET -> "Google WaveNet selezionato. Cambiare provider puo rigenerare audio e consumare caratteri Google."
+            TtsProviderType.ANDROID -> "Voce dispositivo selezionata"
+        }
     }
 
     private fun updateGoogleApiKeyDraft(key: String) {
@@ -665,70 +780,233 @@ class MainActivity : ComponentActivity() {
         googleVoiceName.value = voice
         preferences.edit().putString(KEY_GOOGLE_VOICE, voice).apply()
         configureTtsProvider()
+        statusText.value = "Voce cambiata: potrebbe servire nuova cache audio."
+    }
+
+    private fun updateGoogleChirpVoice(voice: String) {
+        googleChirpVoiceName.value = voice
+        preferences.edit().putString(KEY_GOOGLE_CHIRP_VOICE, voice).apply()
+        configureTtsProvider()
+        statusText.value = "Voce cambiata: potrebbe servire nuova cache audio."
     }
 
     private fun testSelectedVoice() {
+        if (!canRunVoiceTest()) return
         if (isPlaying.value) pauseReading()
-        statusText.value = "Test voce"
+        statusText.value = "Test voce Android: 48 caratteri"
         ttsManager.testAndroidVoice(speechRate.value, voicePitch.value)
     }
 
-    private fun testPremiumVoice() {
-        val text = "Ciao, questa e la voce premium Google Cloud selezionata."
-        if (!canUseGoogleForText(text)) return
+    private fun testPremiumVoice(provider: TtsProviderType) {
+        val text = if (provider == TtsProviderType.GOOGLE_CHIRP) {
+            "Ciao, questa e la voce Google Chirp 3 HD selezionata per Tarlo Speak."
+        } else {
+            "Ciao, questa e la voce Google WaveNet selezionata per Tarlo Speak."
+        }
+        if (!canRunVoiceTest()) return
+        if (!canUseGoogleForText(provider, text)) return
         if (isPlaying.value) pauseReading()
-        configureTtsProvider(TtsProviderType.GOOGLE_CLOUD)
-        statusText.value = "Test voce premium"
+        configureTtsProvider(provider)
+        statusText.value = if (provider == TtsProviderType.GOOGLE_CHIRP) "Test Chirp 3 HD" else "Test WaveNet"
         ttsManager.testGoogleVoice(speechRate.value, voicePitch.value)
     }
 
+    private fun canRunVoiceTest(): Boolean {
+        val now = System.currentTimeMillis()
+        if (now - lastVoiceTestAt < 2500L) {
+            statusText.value = "Attendi un momento prima di ripetere il test voce."
+            return false
+        }
+        lastVoiceTestAt = now
+        return true
+    }
+
     private fun configureTtsProvider(provider: TtsProviderType = selectedProvider.value) {
-        ttsManager.configureProvider(provider, googleApiKey.value, googleVoiceName.value)
+        val voice = if (provider == TtsProviderType.GOOGLE_CHIRP) googleChirpVoiceName.value else googleVoiceName.value
+        ttsManager.configureProvider(provider, googleApiKey.value, voice)
+        ttsManager.configureCache(audioCacheEnabled.value, onlyCacheMode.value, audioCacheMaxSizeMb.value, selectedPreset.value.name)
     }
 
     private fun resolveProviderForText(text: String): TtsProviderType {
-        if (selectedProvider.value != TtsProviderType.GOOGLE_CLOUD) return TtsProviderType.ANDROID
-        if (!canUseGoogleForText(text)) return TtsProviderType.ANDROID
-        return TtsProviderType.GOOGLE_CLOUD
+        return when (selectedProvider.value) {
+            TtsProviderType.GOOGLE_CHIRP -> TtsProviderType.GOOGLE_CHIRP
+            TtsProviderType.GOOGLE_WAVENET -> TtsProviderType.GOOGLE_WAVENET
+            TtsProviderType.ANDROID -> TtsProviderType.ANDROID
+        }
     }
 
-    private fun canUseGoogleForText(text: String): Boolean {
+    private fun canUseGoogleForText(provider: TtsProviderType, text: String): Boolean {
         refreshGoogleUsageMonthIfNeeded()
         if (googleDisabledForMonth.value) {
-            statusText.value = "Google WaveNet disattivato per questo mese. Uso la voce dispositivo."
+            statusText.value = "Google TTS disattivato per questo mese. Uso la voce dispositivo."
             return false
+        }
+        if (onlyCacheMode.value) {
+            return true
         }
         if (googleApiKey.value.isBlank()) {
             statusText.value = "Inserisci una API key Google Cloud per usare WaveNet."
             return false
         }
-        val nextUsage = googleCharsThisMonth.value + text.length
-        if (googleCharsThisMonth.value >= GOOGLE_BLOCK_LIMIT || nextUsage >= GOOGLE_BLOCK_LIMIT) {
-            blockGoogleForSafety()
+        val current = if (provider == TtsProviderType.GOOGLE_CHIRP) googleChirpCharsThisMonth.value else googleWavenetCharsThisMonth.value
+        if (creditSaverMode.value) {
+            if (provider == TtsProviderType.GOOGLE_CHIRP && current >= CHIRP_WARNING_LIMIT) {
+                statusText.value = "Chirp vicino al limite: passo a WaveNet."
+                selectedProvider.value = TtsProviderType.GOOGLE_WAVENET
+                return false
+            }
+            if (provider == TtsProviderType.GOOGLE_WAVENET && current >= WAVENET_WARNING_LIMIT) {
+                statusText.value = "WaveNet vicino al limite: uso Android."
+                selectedProvider.value = TtsProviderType.ANDROID
+                return false
+            }
+        }
+        val limit = if (provider == TtsProviderType.GOOGLE_CHIRP) CHIRP_BLOCK_LIMIT else WAVENET_BLOCK_LIMIT
+        val nextUsage = current + text.length
+        if (current >= limit || nextUsage >= limit) {
+            blockGoogleForSafety(provider)
             return false
         }
         return true
     }
 
-    private fun reserveGoogleCharacters(characters: Int): Boolean {
+    private fun canSendGoogleCharacters(provider: TtsProviderType, characters: Int): Boolean {
         refreshGoogleUsageMonthIfNeeded()
-        val nextUsage = googleCharsThisMonth.value + characters
-        if (nextUsage >= GOOGLE_BLOCK_LIMIT) {
-            blockGoogleForSafety()
+        if (googleDisabledForMonth.value) {
+            statusText.value = "Google e bloccato per sicurezza. Riproduco audio gia salvato dove disponibile."
             return false
         }
-        googleCharsThisMonth.value = nextUsage
+        if (onlyCacheMode.value) {
+            statusText.value = "Modalita solo cache attiva: nessun nuovo carattere Google consumato."
+            return false
+        }
+        val current = if (provider == TtsProviderType.GOOGLE_CHIRP) googleChirpCharsThisMonth.value else googleWavenetCharsThisMonth.value
+        val limit = if (provider == TtsProviderType.GOOGLE_CHIRP) CHIRP_BLOCK_LIMIT else WAVENET_BLOCK_LIMIT
+        val nextUsage = current + characters
+        if (nextUsage >= limit) {
+            blockGoogleForSafety(provider)
+            return false
+        }
+        return true
+    }
+
+    private fun reserveGoogleCharacters(provider: TtsProviderType, characters: Int) {
+        refreshGoogleUsageMonthIfNeeded()
+        val current = if (provider == TtsProviderType.GOOGLE_CHIRP) googleChirpCharsThisMonth.value else googleWavenetCharsThisMonth.value
+        val nextUsage = current + characters
+        if (provider == TtsProviderType.GOOGLE_CHIRP) {
+            googleChirpCharsThisMonth.value = nextUsage
+        } else {
+            googleWavenetCharsThisMonth.value = nextUsage
+        }
+        googleCharsThisMonth.value = googleChirpCharsThisMonth.value + googleWavenetCharsThisMonth.value
         preferences.edit()
             .putString(KEY_GOOGLE_COUNTER_MONTH, googleCounterMonth.value)
-            .putInt(KEY_GOOGLE_CHARS_MONTH, nextUsage)
+            .putInt(KEY_GOOGLE_CHARS_MONTH, googleCharsThisMonth.value)
+            .putInt(KEY_GOOGLE_CHIRP_CHARS_MONTH, googleChirpCharsThisMonth.value)
+            .putInt(KEY_GOOGLE_WAVENET_CHARS_MONTH, googleWavenetCharsThisMonth.value)
             .apply()
-        return true
+    }
+
+    private fun updateAudioCacheEnabled(enabled: Boolean) {
+        audioCacheEnabled.value = enabled
+        preferences.edit().putBoolean(KEY_AUDIO_CACHE_ENABLED, enabled).apply()
+        configureTtsProvider()
+        refreshAudioCacheStats()
+        statusText.value = if (enabled) "Cache audio attivata" else "Cache disattivata."
+    }
+
+    private fun updatePrecacheNextPage(enabled: Boolean) {
+        if (enabled && creditSaverMode.value) {
+            statusText.value = "Modalita risparmio attiva: precaricamento lasciato spento per evitare consumi anticipati."
+            precacheNextPage.value = false
+            preferences.edit().putBoolean(KEY_PRECACHE_NEXT_PAGE, false).apply()
+            return
+        }
+        precacheNextPage.value = enabled
+        preferences.edit().putBoolean(KEY_PRECACHE_NEXT_PAGE, enabled).apply()
+        statusText.value = if (enabled) {
+            "Precaricamento attivo: puo consumare caratteri Google prima dell'ascolto."
+        } else {
+            "Precaricamento pagina successiva disattivato"
+        }
+    }
+
+    private fun updateAudioCacheMaxSize(maxSizeMb: Int) {
+        audioCacheMaxSizeMb.value = maxSizeMb
+        preferences.edit().putInt(KEY_AUDIO_CACHE_MAX_MB, maxSizeMb).apply()
+        scope.launch(Dispatchers.IO) {
+            audioCacheManager.trimToLimit(maxSizeMb)
+            withContext(Dispatchers.Main) {
+                configureTtsProvider()
+                refreshAudioCacheStats("Limite cache aggiornato")
+            }
+        }
+    }
+
+    private fun clearAudioCacheWithConfirmation() {
+        if (isPlaying.value) {
+            statusText.value = "Ferma la lettura prima di svuotare la cache audio."
+            return
+        }
+        if (!clearAudioCacheConfirmation.value) {
+            clearAudioCacheConfirmation.value = true
+            statusText.value = "Svuotando la cache, le pagine gia generate consumeranno nuovamente caratteri Google."
+            return
+        }
+        clearAudioCacheConfirmation.value = false
+        scope.launch(Dispatchers.IO) {
+            audioCacheManager.clear()
+            withContext(Dispatchers.Main) {
+                refreshAudioCacheStats("Cache svuotata.")
+            }
+        }
+    }
+
+    private fun refreshAudioCacheStats(message: String? = null) {
+        audioCacheStats.value = audioCacheManager.stats(
+            enabled = audioCacheEnabled.value,
+            hitCount = audioCacheHitCount.value,
+            savedCharacters = audioCacheSavedCharacters.value,
+            maxSizeMb = audioCacheMaxSizeMb.value
+        )
+        message?.let { statusText.value = it }
+    }
+
+    private fun saveAudioCacheCounters() {
+        preferences.edit()
+            .putInt(KEY_AUDIO_CACHE_HITS, audioCacheHitCount.value)
+            .putInt(KEY_AUDIO_CACHE_SAVED_CHARS, audioCacheSavedCharacters.value)
+            .apply()
+    }
+
+    private fun updateCreditSaverMode(enabled: Boolean) {
+        creditSaverMode.value = enabled
+        if (enabled && precacheNextPage.value) {
+            precacheNextPage.value = false
+            preferences.edit().putBoolean(KEY_PRECACHE_NEXT_PAGE, false).apply()
+        }
+        preferences.edit().putBoolean(KEY_CREDIT_SAVER_MODE, enabled).apply()
+        statusText.value = if (enabled) "Modalita risparmio crediti attiva" else "Modalita risparmio crediti disattivata"
+    }
+
+    private fun updateOnlyCacheMode(enabled: Boolean) {
+        onlyCacheMode.value = enabled
+        preferences.edit().putBoolean(KEY_ONLY_CACHE_MODE, enabled).apply()
+        configureTtsProvider()
+        statusText.value = if (enabled) "Modalita solo cache attiva: nessun nuovo carattere Google consumato." else "Modalita solo cache disattivata"
     }
 
     private fun loadGoogleUsage() {
         googleCounterMonth.value = preferences.getString(KEY_GOOGLE_COUNTER_MONTH, currentMonthKey()).orEmpty()
             .ifBlank { currentMonthKey() }
         googleCharsThisMonth.value = preferences.getInt(KEY_GOOGLE_CHARS_MONTH, 0)
+        googleChirpCharsThisMonth.value = preferences.getInt(KEY_GOOGLE_CHIRP_CHARS_MONTH, 0)
+        googleWavenetCharsThisMonth.value = preferences.getInt(KEY_GOOGLE_WAVENET_CHARS_MONTH, 0)
+        if (googleChirpCharsThisMonth.value == 0 && googleWavenetCharsThisMonth.value == 0 && googleCharsThisMonth.value > 0) {
+            googleWavenetCharsThisMonth.value = googleCharsThisMonth.value
+        }
+        googleCharsThisMonth.value = googleChirpCharsThisMonth.value + googleWavenetCharsThisMonth.value
         refreshGoogleUsageMonthIfNeeded()
     }
 
@@ -737,10 +1015,14 @@ class MainActivity : ComponentActivity() {
         if (googleCounterMonth.value != now) {
             googleCounterMonth.value = now
             googleCharsThisMonth.value = 0
+            googleChirpCharsThisMonth.value = 0
+            googleWavenetCharsThisMonth.value = 0
             googleDisabledForMonth.value = false
             preferences.edit()
                 .putString(KEY_GOOGLE_COUNTER_MONTH, now)
                 .putInt(KEY_GOOGLE_CHARS_MONTH, 0)
+                .putInt(KEY_GOOGLE_CHIRP_CHARS_MONTH, 0)
+                .putInt(KEY_GOOGLE_WAVENET_CHARS_MONTH, 0)
                 .putBoolean(KEY_GOOGLE_DISABLED_MONTH, false)
                 .apply()
         }
@@ -755,38 +1037,66 @@ class MainActivity : ComponentActivity() {
         resetCounterConfirmation.value = false
         googleCounterMonth.value = currentMonthKey()
         googleCharsThisMonth.value = 0
+        googleChirpCharsThisMonth.value = 0
+        googleWavenetCharsThisMonth.value = 0
         googleDisabledForMonth.value = false
         preferences.edit()
             .putString(KEY_GOOGLE_COUNTER_MONTH, googleCounterMonth.value)
             .putInt(KEY_GOOGLE_CHARS_MONTH, 0)
+            .putInt(KEY_GOOGLE_CHIRP_CHARS_MONTH, 0)
+            .putInt(KEY_GOOGLE_WAVENET_CHARS_MONTH, 0)
             .putBoolean(KEY_GOOGLE_DISABLED_MONTH, false)
             .apply()
         statusText.value = "Contatore Google Cloud azzerato"
     }
 
-    private fun googleWarningText(): String? {
-        val used = googleCharsThisMonth.value
-        return when {
-            isGoogleBlocked() -> "Google WaveNet bloccato per sicurezza"
-            used >= GOOGLE_STRONG_WARNING_LIMIT -> "Hai raggiunto 900.000 caratteri Google questo mese. Per evitare costi, Google WaveNet verra bloccato a 950.000."
-            used >= GOOGLE_WARNING_LIMIT -> "Hai raggiunto 850.000 caratteri Google questo mese. Sei vicino al limite sicurezza."
-            else -> null
+    private fun googleWarningText(provider: TtsProviderType): String? {
+        val used = if (provider == TtsProviderType.GOOGLE_CHIRP) googleChirpCharsThisMonth.value else googleWavenetCharsThisMonth.value
+        return if (provider == TtsProviderType.GOOGLE_CHIRP) {
+            when {
+                isChirpBlocked() -> "Chirp 3 HD bloccato per sicurezza. Uso Google WaveNet."
+                used >= CHIRP_STRONG_WARNING_LIMIT -> "Hai raggiunto 850.000 caratteri Chirp 3 HD. Verra bloccato a 900.000."
+                used >= CHIRP_WARNING_LIMIT -> "Hai raggiunto 750.000 caratteri Chirp 3 HD. Sei vicino al limite sicurezza."
+                else -> null
+            }
+        } else {
+            when {
+                isWavenetBlocked() -> "WaveNet bloccato per sicurezza. Uso Android TTS."
+                used >= WAVENET_STRONG_WARNING_LIMIT -> "Hai raggiunto 3.500.000 caratteri WaveNet. Verra bloccato a 3.800.000."
+                used >= WAVENET_WARNING_LIMIT -> "Hai raggiunto 3.000.000 caratteri WaveNet. Sei vicino al limite sicurezza."
+                else -> null
+            }
         }
     }
 
-    private fun blockGoogleForSafety() {
-        selectedProvider.value = TtsProviderType.ANDROID
-        preferences.edit().putString(KEY_SELECTED_PROVIDER, TtsProviderType.ANDROID.name).apply()
-        configureTtsProvider(TtsProviderType.ANDROID)
-        statusText.value = "Limite sicurezza Google raggiunto. Per evitare costi, la lettura continua con la voce dispositivo."
+    private fun blockGoogleForSafety(provider: TtsProviderType) {
+        if (provider == TtsProviderType.GOOGLE_CHIRP && !isWavenetBlocked()) {
+            selectedProvider.value = TtsProviderType.GOOGLE_WAVENET
+            preferences.edit().putString(KEY_SELECTED_PROVIDER, TtsProviderType.GOOGLE_WAVENET.name).apply()
+            configureTtsProvider(TtsProviderType.GOOGLE_WAVENET)
+            statusText.value = "Chirp 3 HD bloccato per sicurezza. Uso Google WaveNet."
+        } else {
+            selectedProvider.value = TtsProviderType.ANDROID
+            preferences.edit().putString(KEY_SELECTED_PROVIDER, TtsProviderType.ANDROID.name).apply()
+            configureTtsProvider(TtsProviderType.ANDROID)
+            statusText.value = "Limite sicurezza Google raggiunto. Per evitare costi, la lettura continua con la voce dispositivo."
+        }
     }
 
-    private fun isGoogleBlocked(): Boolean {
-        return googleDisabledForMonth.value || googleCharsThisMonth.value >= GOOGLE_BLOCK_LIMIT
+    private fun isChirpBlocked(): Boolean {
+        return googleDisabledForMonth.value || googleChirpCharsThisMonth.value >= CHIRP_BLOCK_LIMIT
     }
 
-    private fun googleSafetyPercent(): Int {
-        return ((googleCharsThisMonth.value.toFloat() / GOOGLE_BLOCK_LIMIT.toFloat()) * 100f).toInt().coerceIn(0, 100)
+    private fun isWavenetBlocked(): Boolean {
+        return googleDisabledForMonth.value || googleWavenetCharsThisMonth.value >= WAVENET_BLOCK_LIMIT
+    }
+
+    private fun isAllGoogleBlocked(): Boolean {
+        return googleDisabledForMonth.value || (isChirpBlocked() && isWavenetBlocked())
+    }
+
+    private fun googleSafetyPercent(used: Int, limit: Int): Int {
+        return ((used.toFloat() / limit.toFloat()) * 100f).toInt().coerceIn(0, 100)
     }
 
     private fun maskApiKey(key: String): String {
@@ -795,12 +1105,84 @@ class MainActivity : ComponentActivity() {
         return key.take(6) + "***************" + key.takeLast(4)
     }
 
+    private fun refreshGoogleVoices() {
+        if (googleApiKey.value.isBlank()) {
+            statusText.value = "Inserisci una API key Google Cloud per aggiornare le voci"
+            return
+        }
+
+        scope.launch {
+            statusText.value = "Aggiorno voci Google..."
+            val voices = withContext(Dispatchers.IO) {
+                runCatching { fetchGoogleVoices(googleApiKey.value) }
+            }.getOrElse {
+                statusText.value = "Impossibile aggiornare voci Google"
+                return@launch
+            }
+            val italian = voices.filter { it.isItalian }
+            googleChirpVoices.value = italian.filter { it.isChirp }.sortedBy { it.name }
+            googleWavenetVoices.value = italian.filter { it.isWavenet }.sortedBy { it.name }
+            googleChirpVoices.value.firstOrNull()?.let {
+                googleChirpVoiceName.value = it.name
+                preferences.edit().putString(KEY_GOOGLE_CHIRP_VOICE, it.name).apply()
+            }
+            googleWavenetVoices.value.firstOrNull()?.let {
+                googleVoiceName.value = it.name
+                preferences.edit().putString(KEY_GOOGLE_VOICE, it.name).apply()
+            }
+            statusText.value = if (googleChirpVoices.value.isEmpty()) {
+                "Nessuna voce Chirp 3 HD italiana trovata. Uso Google WaveNet."
+            } else {
+                "Voci Google italiane aggiornate"
+            }
+        }
+    }
+
+    private fun fetchGoogleVoices(apiKey: String): List<GoogleVoiceInfo> {
+        val endpoint = "https://texttospeech.googleapis.com/v1/voices?key=${URLEncoder.encode(apiKey, "UTF-8")}"
+        val connection = (URL(endpoint).openConnection() as HttpURLConnection).apply {
+            requestMethod = "GET"
+            connectTimeout = 15000
+            readTimeout = 30000
+        }
+        val code = connection.responseCode
+        val response = if (code in 200..299) {
+            connection.inputStream.bufferedReader().use { it.readText() }
+        } else {
+            throw IllegalStateException("Errore voci Google ($code)")
+        }
+        return parseGoogleVoices(response)
+    }
+
+    private fun parseGoogleVoices(json: String): List<GoogleVoiceInfo> {
+        return Regex("\\{\\s*\"languageCodes\"[\\s\\S]*?\\n\\s*\\}").findAll(json).mapNotNull { match ->
+            val block = match.value
+            val name = Regex("\"name\"\\s*:\\s*\"([^\"]+)\"").find(block)?.groupValues?.getOrNull(1) ?: return@mapNotNull null
+            val languagesBlock = Regex("\"languageCodes\"\\s*:\\s*\\[([\\s\\S]*?)\\]").find(block)?.groupValues?.getOrNull(1).orEmpty()
+            val languages = Regex("\"([^\"]+)\"").findAll(languagesBlock).map { it.groupValues[1] }.toList()
+            val gender = Regex("\"ssmlGender\"\\s*:\\s*\"([^\"]+)\"").find(block)?.groupValues?.getOrNull(1) ?: "Non specificato"
+            val sampleRate = Regex("\"naturalSampleRateHertz\"\\s*:\\s*(\\d+)").find(block)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 0
+            GoogleVoiceInfo(name, languages, gender, sampleRate)
+        }.toList()
+    }
+
+    private fun currentWavenetVoiceNames(): List<String> {
+        return googleWavenetVoices.value.map { it.name }.ifEmpty { GoogleCloudTtsProvider.ITALIAN_WAVENET_VOICES }
+    }
+
     private fun handleTtsError(message: String) {
-        if (lastSpeechProvider == TtsProviderType.GOOGLE_CLOUD && isPlaying.value) {
-            selectedProvider.value = TtsProviderType.ANDROID
-            preferences.edit().putString(KEY_SELECTED_PROVIDER, TtsProviderType.ANDROID.name).apply()
-            configureTtsProvider(TtsProviderType.ANDROID)
-            statusText.value = "$message. Uso la voce dispositivo."
+        if (isPlaying.value && lastSpeechProvider.isGoogle) {
+            if (lastSpeechProvider == TtsProviderType.GOOGLE_CHIRP && !isWavenetBlocked() && googleApiKey.value.isNotBlank()) {
+                selectedProvider.value = TtsProviderType.GOOGLE_WAVENET
+                preferences.edit().putString(KEY_SELECTED_PROVIDER, TtsProviderType.GOOGLE_WAVENET.name).apply()
+                configureTtsProvider(TtsProviderType.GOOGLE_WAVENET)
+                statusText.value = "$message. Provo Google WaveNet."
+            } else {
+                selectedProvider.value = TtsProviderType.ANDROID
+                preferences.edit().putString(KEY_SELECTED_PROVIDER, TtsProviderType.ANDROID.name).apply()
+                configureTtsProvider(TtsProviderType.ANDROID)
+                statusText.value = "$message. Uso la voce dispositivo."
+            }
             speakCurrentSegment()
         } else {
             isPlaying.value = false
@@ -845,13 +1227,28 @@ class MainActivity : ComponentActivity() {
         private const val KEY_SELECTED_PROVIDER = "selected_provider"
         private const val KEY_GOOGLE_API_KEY = "google_api_key"
         private const val KEY_GOOGLE_VOICE = "google_voice"
+        private const val KEY_GOOGLE_CHIRP_VOICE = "google_chirp_voice"
         private const val KEY_GOOGLE_COUNTER_MONTH = "google_counter_month"
         private const val KEY_GOOGLE_CHARS_MONTH = "google_chars_month"
+        private const val KEY_GOOGLE_CHIRP_CHARS_MONTH = "google_chirp_chars_month"
+        private const val KEY_GOOGLE_WAVENET_CHARS_MONTH = "google_wavenet_chars_month"
         private const val KEY_GOOGLE_DISABLED_MONTH = "google_disabled_month"
-        private const val GOOGLE_MONTHLY_LIMIT = 1_000_000
-        private const val GOOGLE_WARNING_LIMIT = 850_000
-        private const val GOOGLE_STRONG_WARNING_LIMIT = 900_000
-        private const val GOOGLE_BLOCK_LIMIT = 950_000
+        private const val KEY_AUDIO_CACHE_ENABLED = "audio_cache_enabled"
+        private const val KEY_PRECACHE_NEXT_PAGE = "precache_next_page"
+        private const val KEY_AUDIO_CACHE_MAX_MB = "audio_cache_max_mb"
+        private const val KEY_AUDIO_CACHE_HITS = "audio_cache_hits"
+        private const val KEY_AUDIO_CACHE_SAVED_CHARS = "audio_cache_saved_chars"
+        private const val KEY_CREDIT_SAVER_MODE = "credit_saver_mode"
+        private const val KEY_ONLY_CACHE_MODE = "only_cache_mode"
+        private const val GOOGLE_TOTAL_MONTHLY_LIMIT = 5_000_000
+        private const val CHIRP_MONTHLY_LIMIT = 1_000_000
+        private const val CHIRP_WARNING_LIMIT = 750_000
+        private const val CHIRP_STRONG_WARNING_LIMIT = 850_000
+        private const val CHIRP_BLOCK_LIMIT = 900_000
+        private const val WAVENET_MONTHLY_LIMIT = 4_000_000
+        private const val WAVENET_WARNING_LIMIT = 3_000_000
+        private const val WAVENET_STRONG_WARNING_LIMIT = 3_500_000
+        private const val WAVENET_BLOCK_LIMIT = 3_800_000
 
         private fun currentMonthKey(): String {
             return SimpleDateFormat("yyyy-MM", Locale.US).format(Date())

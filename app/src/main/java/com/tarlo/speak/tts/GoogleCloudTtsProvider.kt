@@ -2,7 +2,9 @@ package com.tarlo.speak.tts
 
 import android.content.Context
 import android.media.MediaPlayer
+import android.media.PlaybackParams
 import android.util.Base64
+import com.tarlo.speak.model.TtsProviderType
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -18,27 +20,43 @@ class GoogleCloudTtsProvider(
     context: Context,
     private val onChunkStarted: () -> Unit,
     private val onChunkDone: () -> Unit,
-    private val onCharactersWillBeSent: (Int) -> Boolean,
+    private val onCharactersCanBeSent: (TtsProviderType, Int) -> Boolean,
+    private val onCharactersSent: (TtsProviderType, Int) -> Unit,
+    private val onCacheHit: (Int) -> Unit,
+    private val onCacheStored: () -> Unit,
+    private val onCacheWriteSkipped: () -> Unit,
     private val onError: (String) -> Unit
 ) : TtsProvider {
     private val appContext = context.applicationContext
+    private val audioCache = AudioCacheManager(appContext)
     private val scope = CoroutineScope(Dispatchers.Main)
     private var requestJob: Job? = null
     private var mediaPlayer: MediaPlayer? = null
     private var apiKey: String = ""
     private var voiceName: String = DEFAULT_VOICE
+    private var providerType: TtsProviderType = TtsProviderType.GOOGLE_WAVENET
+    private var playbackSpeed: Float = 1.0f
+    private var cacheEnabled: Boolean = true
+    private var onlyCacheMode: Boolean = false
+    private var cacheMaxSizeMb: Int = 500
+    private var presetName: String = "AUDIOBOOK_PRO"
 
-    fun configure(apiKey: String, voiceName: String) {
+    fun configure(apiKey: String, voiceName: String, providerType: TtsProviderType) {
         this.apiKey = apiKey.trim()
         this.voiceName = voiceName.ifBlank { DEFAULT_VOICE }
+        this.providerType = providerType
+    }
+
+    fun configureCache(enabled: Boolean, onlyCacheMode: Boolean, maxSizeMb: Int, presetName: String) {
+        this.cacheEnabled = enabled
+        this.onlyCacheMode = onlyCacheMode
+        this.cacheMaxSizeMb = maxSizeMb
+        this.presetName = presetName
+        if (enabled) audioCache.trimToLimit(maxSizeMb)
     }
 
     override fun speak(text: String, speed: Float, pitch: Float, utteranceId: String) {
-        if (apiKey.isBlank()) {
-            onError("Inserisci una API key Google Cloud")
-            return
-        }
-
+        playbackSpeed = speed.coerceIn(0.70f, 1.40f)
         stop()
         onChunkStarted()
         requestJob = scope.launch {
@@ -68,7 +86,31 @@ class GoogleCloudTtsProvider(
     }
 
     private fun synthesizeToTempMp3(text: String, speed: Float, pitch: Float, utteranceId: String): File {
-        val allowed = runBlocking(Dispatchers.Main) { onCharactersWillBeSent(text.length) }
+        val cacheFile = audioCache.cacheFile(
+            provider = providerType,
+            voiceName = voiceName,
+            language = "it-IT",
+            text = text,
+            speed = speed,
+            pitch = pitch,
+            presetName = presetName,
+            chirpUsesPlayerSpeed = providerType == TtsProviderType.GOOGLE_CHIRP
+        )
+        if (cacheEnabled && cacheFile.exists() && cacheFile.length() > 0L) {
+            cacheFile.setLastModified(System.currentTimeMillis())
+            runBlocking(Dispatchers.Main) { onCacheHit(text.length) }
+            return cacheFile
+        }
+
+        if (onlyCacheMode) {
+            throw IllegalStateException("Modalita solo cache attiva: nessun nuovo carattere Google consumato.")
+        }
+
+        if (apiKey.isBlank()) {
+            throw IllegalStateException("Inserisci una API key Google Cloud")
+        }
+
+        val allowed = runBlocking(Dispatchers.Main) { onCharactersCanBeSent(providerType, text.length) }
         if (!allowed) {
             throw IllegalStateException("Limite sicurezza Google raggiunto")
         }
@@ -102,22 +144,33 @@ class GoogleCloudTtsProvider(
 
         val bytes = runCatching { Base64.decode(audioContent, Base64.DEFAULT) }
             .getOrElse { throw IllegalStateException("Risposta audio Google Cloud non valida") }
-        val file = File(appContext.cacheDir, "tarlo_google_tts_$utteranceId.mp3")
-        file.writeBytes(bytes)
-        return file
+        runBlocking(Dispatchers.Main) { onCharactersSent(providerType, text.length) }
+        val tempFile = File(appContext.cacheDir, "tarlo_google_tts_$utteranceId.mp3")
+        tempFile.writeBytes(bytes)
+
+        if (cacheEnabled) {
+            runCatching {
+                audioCache.trimToLimit(cacheMaxSizeMb)
+                if (audioCache.hasEnoughRoomFor(bytes.size, cacheMaxSizeMb)) {
+                    cacheFile.parentFile?.mkdirs()
+                    tempFile.copyTo(cacheFile, overwrite = true)
+                    cacheFile.setLastModified(System.currentTimeMillis())
+                    audioCache.trimToLimit(cacheMaxSizeMb)
+                    runBlocking(Dispatchers.Main) { onCacheStored() }
+                    return cacheFile
+                } else {
+                    runBlocking(Dispatchers.Main) { onCacheWriteSkipped() }
+                }
+            }.onFailure {
+                runBlocking(Dispatchers.Main) { onCacheWriteSkipped() }
+            }
+        }
+
+        return tempFile
     }
 
     private fun synthesizeToTempMp3WithFallbackVoice(text: String, speed: Float, pitch: Float, utteranceId: String): File {
-        return runCatching {
-            synthesizeToTempMp3(text, speed, pitch, utteranceId)
-        }.getOrElse { firstError ->
-            val message = firstError.message.orEmpty().lowercase()
-            if ("voce" !in message && "richiesta" !in message) throw firstError
-            val alternative = ITALIAN_WAVENET_VOICES.firstOrNull { it != voiceName } ?: DEFAULT_VOICE
-            if (alternative == voiceName) throw firstError
-            voiceName = alternative
-            synthesizeToTempMp3(text, speed, pitch, "${utteranceId}_fallback")
-        }
+        return synthesizeToTempMp3(text, speed, pitch, utteranceId)
     }
 
     private fun playFile(file: File) {
@@ -132,17 +185,27 @@ class GoogleCloudTtsProvider(
             setOnErrorListener { player, _, _ ->
                 player.release()
                 if (mediaPlayer === player) mediaPlayer = null
+                if (file.parentFile?.name == "tarlo_audio_cache") runCatching { file.delete() }
                 onError("Errore durante la riproduzione della voce premium")
                 true
             }
             prepare()
+            if (providerType == TtsProviderType.GOOGLE_CHIRP) {
+                runCatching {
+                    playbackParams = PlaybackParams().setSpeed(playbackSpeed).setPitch(1.0f)
+                }
+            }
             start()
         }
     }
 
     private fun buildRequestJson(text: String, speed: Float, pitch: Float): String {
+        val chirp = providerType == TtsProviderType.GOOGLE_CHIRP
         val safeRate = speed.coerceIn(0.25f, 4.0f)
         val safePitch = ((pitch - 1.0f) * 20f).coerceIn(-20f, 20f)
+        val tuning = if (chirp) "" else """,
+                "speakingRate": $safeRate,
+                "pitch": $safePitch"""
         return """
             {
               "input": { "text": "${escapeJson(text)}" },
@@ -151,9 +214,7 @@ class GoogleCloudTtsProvider(
                 "name": "${escapeJson(voiceName)}"
               },
               "audioConfig": {
-                "audioEncoding": "MP3",
-                "speakingRate": $safeRate,
-                "pitch": $safePitch
+                "audioEncoding": "MP3"$tuning
               }
             }
         """.trimIndent()
@@ -193,6 +254,7 @@ class GoogleCloudTtsProvider(
 
     companion object {
         const val DEFAULT_VOICE = "it-IT-Wavenet-A"
+        const val DEFAULT_CHIRP_VOICE = "it-IT-Chirp3-HD-Achernar"
         val ITALIAN_WAVENET_VOICES = listOf(
             "it-IT-Wavenet-A",
             "it-IT-Wavenet-B",
