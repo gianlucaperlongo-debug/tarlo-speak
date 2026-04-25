@@ -10,7 +10,7 @@ import java.util.UUID
 import java.util.zip.ZipInputStream
 
 class DocumentRepository(private val context: Context) {
-    fun loadEpub(uri: Uri, maxChunkLength: Int = 680): AudioDocument {
+    fun loadEpub(uri: Uri, pageLength: Int = 1650): AudioDocument {
         val htmlParts = mutableListOf<String>()
         var metadataTitle: String? = null
 
@@ -47,7 +47,7 @@ class DocumentRepository(private val context: Context) {
         return AudioDocument(
             id = UUID.randomUUID().toString(),
             title = title,
-            chunks = chunkText(allText, maxChunkLength)
+            pages = paginateText(allText, pageLength)
         )
     }
 
@@ -102,39 +102,55 @@ class DocumentRepository(private val context: Context) {
             .trim()
     }
 
-    fun chunkText(text: String, maxChunkLength: Int = 680): List<String> {
+    fun paginateText(text: String, pageLength: Int = 1650): List<String> {
         if (text.isBlank()) return emptyList()
 
         val result = mutableListOf<String>()
         val current = StringBuilder()
-        val normalizedMax = maxChunkLength.coerceIn(320, 1100)
+        val normalizedMax = pageLength.coerceIn(900, 2600)
 
         text.split(Regex("\\n\\s*\\n+")).forEach { paragraph ->
-            val sentences = paragraph.split(Regex("(?<=[.!?;:])\\s+"))
-            sentences.forEach { sentence ->
-                val clean = sentence.trim()
-                if (clean.isBlank()) return@forEach
+            val cleanParagraph = paragraph.trim()
+            if (cleanParagraph.isBlank()) return@forEach
 
-                if (current.length + clean.length + 1 > normalizedMax && current.isNotBlank()) {
-                    result += current.toString().trim()
-                    current.clear()
-                }
-
-                if (clean.length > normalizedMax) {
-                    clean.chunked(normalizedMax - 40).forEach { result += it.trim() }
-                } else {
-                    current.append(clean).append(' ')
-                }
-            }
-
-            if (current.isNotBlank()) {
+            if (current.length + cleanParagraph.length + 2 > normalizedMax && current.isNotBlank()) {
                 result += current.toString().trim()
                 current.clear()
+            }
+
+            if (cleanParagraph.length > normalizedMax) {
+                cleanParagraph.split(Regex("(?<=[.!?;:])\\s+")).forEach { sentence ->
+                    val cleanSentence = sentence.trim()
+                    if (cleanSentence.isBlank()) return@forEach
+                    if (current.length + cleanSentence.length + 1 > normalizedMax && current.isNotBlank()) {
+                        result += current.toString().trim()
+                        current.clear()
+                    }
+                    if (cleanSentence.length > normalizedMax) {
+                        cleanSentence.chunked(normalizedMax).forEach { part ->
+                            if (current.isNotBlank()) {
+                                result += current.toString().trim()
+                                current.clear()
+                            }
+                            result += part.trim()
+                        }
+                    } else {
+                        current.append(cleanSentence).append(' ')
+                    }
+                }
+            } else {
+                current.append(cleanParagraph).append("\n\n")
             }
         }
 
         if (current.isNotBlank()) result += current.toString().trim()
         return result
+    }
+
+    fun pageLengthFor(fontSizeSp: Float, lineHeightMultiplier: Float, baseLength: Int = 850): Int {
+        val fontFactor = 20f / fontSizeSp.coerceIn(16f, 28f)
+        val lineFactor = 1.45f / lineHeightMultiplier.coerceIn(1.15f, 1.80f)
+        return (baseLength * fontFactor * lineFactor).toInt().coerceIn(520, 1400)
     }
 
     fun safeName(name: String): String {

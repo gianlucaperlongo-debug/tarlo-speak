@@ -5,6 +5,7 @@ import androidx.compose.ui.graphics.Color
 object TarloColors {
     val Background = Color(0xFFF7F4EF)
     val Surface = Color(0xFFFFFFFF)
+    val Page = Color(0xFFFFFCF7)
     val SurfaceMuted = Color(0xFFEDE8DF)
     val Ink = Color(0xFF171717)
     val Muted = Color(0xFF6C675F)
